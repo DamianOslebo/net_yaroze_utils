@@ -64,17 +64,18 @@ def to_psx_normal(normal):
         round(+normal.y / precision) * precision,
     )
 
-def get_face_uvs(mesh, poly, uv_layer):
+def get_face_uvs(mesh, poly, uv_layer, op):
     if not uv_layer:
         raise ValueError(f"Mesh {mesh.name} needs an active UV map")
-
+    tex_w = op.tex_width
+    tex_h = op.tex_height
     uvs = []
 
     for loop_index in poly.loop_indices:
         uv = uv_layer.data[loop_index].uv
 
-        u = int(round(uv.x * 31)) & 0xFF
-        v = int(round((1.0 - uv.y) * 31)) & 0xFF
+        u = int(round(uv.x * (tex_w - 1))) & 0xFF
+        v = int(round((1.0 - uv.y) * (tex_h - 1))) & 0xFF
 
         uvs.append((u, v))
 
@@ -100,6 +101,7 @@ def get_face_color(mesh, poly, vertex_colors, vertex_colors_domain):
             max(0, min(255, int(round(color[1] * 255.0)))),
             max(0, min(255, int(round(color[2] * 255.0)))),
         ]
+
     return face_color
 
 def face_uses_texture(mesh, poly, op):
@@ -114,7 +116,11 @@ def face_uses_texture(mesh, poly, op):
     if not material or not material.use_nodes:
         return False
 
-    return any(node.type == 'TEX_IMAGE' and node.image is not None for node in material.node_tree.nodes)
+    for node in material.node_tree.nodes:
+        if node.type == 'TEX_IMAGE' and node.image is not None:
+            return True
+
+    return False
 
 def make_tsb(tpage, abr=0, tp=0):
     return tpage | (abr << 5) | (tp << 7)
@@ -146,11 +152,10 @@ def write_tmd_header(f, mesh, normals):
 
     f.write(struct.pack('I', 0))
 
-    primitive_top_addr = f.tell() - object_start
-
-    f.seek(primitive_top_addr_pos)
-    f.write(struct.pack('I', primitive_top_addr))
-    f.seek(object_start + 24)
+    #primitive_top_addr = f.tell() - object_start
+    #f.seek(primitive_top_addr_pos)
+    #f.write(struct.pack('I', primitive_top_addr))
+    #f.seek(object_start + 24)
 
     return {
         "object_start": object_start,
@@ -221,7 +226,7 @@ def write_colored_triangle(f, verts, normal_index, face_color, unlit_bit):
     mode = 0x21 if unlit_bit else 0x20
 
     f.write(struct.pack('BBBB', 4, 3, unlit_bit, mode))
-    f.write(struct.pack('BBBB', face_color[0], face_color[1], face_color[2], mode))
+    f.write(struct.pack('BBBB', face_color[2], face_color[1], face_color[0], mode))
     f.write(struct.pack('HHHH', normal_index, verts[2], verts[1], verts[0]))
 
 def write_textured_triangle(f, verts, uvs, normal_index, op, unlit_bit):
@@ -239,8 +244,14 @@ def write_textured_triangle(f, verts, uvs, normal_index, op, unlit_bit):
 
     f.write(struct.pack('HHHH', normal_index, verts[2], verts[1], verts[0]))
 
-def write_primitives(f, mesh, data, op):
+def write_primitives(f, mesh, data, op, header):
     unlit_bit = 1 if op and op.unlit else 0
+
+    primitive_pos = f.tell()
+    primitive_top_addr = primitive_pos - header["object_start"]
+    f.seek(header["primitive_top_addr_pos"])
+    f.write(struct.pack('I', primitive_top_addr))
+    f.seek(primitive_pos)
 
     for poly in mesh.polygons:
         verts = [mesh.loops[li].vertex_index for li in poly.loop_indices]
@@ -249,7 +260,8 @@ def write_primitives(f, mesh, data, op):
         normal_index = data["normal_map"][psx_normal]
 
         if face_uses_texture(mesh, poly, op):
-            uvs = get_face_uvs( mesh, poly, data["uv_layer"])
+        #if op and op.color_mode == 'TEXTURE':
+            uvs = get_face_uvs( mesh, poly, data["uv_layer"],op)
 
             write_textured_triangle(f, verts, uvs, normal_index, op, unlit_bit)
             
@@ -263,11 +275,15 @@ def write_tmd_from_mesh(mesh, path, op=None):
     data = prepare_mesh_data(mesh, op)
 
     with open(path, 'wb') as f:
-        header = write_tmd_header(f, data)
-        write_primitives(f, mesh, data, op)
+        header = write_tmd_header(f, mesh, data['normals'])
+        write_primitives(f, mesh, data, op, header)
         write_vertices(f, mesh, header)
         write_normals(f, data["normals"], header)
-    
+        
+    print("object_start:", header["object_start"])
+    print("primitive_top_addr_pos:", header["primitive_top_addr_pos"])
+    print("vertex_top_addr_pos:", header["vert_top_addr_pos"])
+    print("normal_top_addr_pos:", header["normal_top_addr_pos"])
 
 def apply_modifiers(obj):
     ctx = bpy.context.copy()
@@ -350,12 +366,12 @@ class ExportTMD(Operator, ExportHelper):
 
     filename_ext = ".tmd"
 
-    filter_glob = StringProperty(
+    filter_glob: StringProperty(
         default="*.tmd",
         options={'HIDDEN'},
         maxlen=255,
     )
-    
+
     color_mode: EnumProperty(
         name="Color Mode",
         description="How to color the polygons",
@@ -365,16 +381,16 @@ class ExportTMD(Operator, ExportHelper):
         ],
         default='VERTEX_COLOR',
     )
-    
+
     unlit: BoolProperty(
         name="Unlit",
         description="Disable light-source calculation (easier to see while testing)",
         default=False,
     )
 
-    # only used when color_mode == 'TEXTURE'
-    tpage: IntProperty(name="Texture Page", default=0, min=0, max=31)
-    tp: EnumProperty(          # colour depth
+    # Texture options (only used when color_mode == 'TEXTURE')
+    tpage: IntProperty(name="Texture Page", default=10, min=0, max=31)
+    tp: EnumProperty(
         name="Texture BPP",
         items=[
             ('0', "4-bit", ""),
@@ -385,18 +401,28 @@ class ExportTMD(Operator, ExportHelper):
     )
     clut_x: IntProperty(name="CLUT X", default=0, min=0, max=960)
     clut_y: IntProperty(name="CLUT Y", default=480, min=0, max=511)
-    
+
+    # For non-256 textures (e.g. your 32×32)
+    tex_width: IntProperty(name="Texture Width", default=32, min=1, max=256)
+    tex_height: IntProperty(name="Texture Height", default=32, min=1, max=256)
+
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "color_mode")
+        layout.prop(self, "unlit")
+
         if self.color_mode == 'TEXTURE':
-            layout.prop(self, "tpage")
-            layout.prop(self, "tp")
-            layout.prop(self, "clut_x")
-            layout.prop(self, "clut_y")
+            box = layout.box()
+            box.label(text="Texture Settings")
+            box.prop(self, "tpage")
+            box.prop(self, "tp")
+            box.prop(self, "clut_x")
+            box.prop(self, "clut_y")
+            box.prop(self, "tex_width")
+            box.prop(self, "tex_height")
 
     def execute(self, context):
-        write_tmd(context, self.filepath,self)
+        write_tmd(context, self.filepath, self)
         return {'FINISHED'}
 
 
@@ -427,29 +453,17 @@ def unregister():
 
 if __name__ == "__main__":
     if "--" in sys.argv:
-        args = sys.argv[sys.argv.index("--") + 1:]
-
-        export_filename = None
-
-        for i, arg in enumerate(args):
-            if arg == "--output" and i + 1 < len(args):
-                export_filename = args[i + 1]
-
-        if export_filename is None:
-            raise RuntimeError(
-                "Usage: blender file.blend --background "
-                "--python tmd_export.py -- --output output.tmd"
-            )
-
+        # create a dummy options object
         class Dummy:
             color_mode = 'VERTEX_COLOR'
             tpage = 0
             tp = '2'
             clut_x = 0
             clut_y = 480
+            tex_width = 32
+            tex_height = 32
             unlit = False
-
-        write_tmd(bpy.context, export_filename, Dummy())
+        write_tmd(bpy.context, "tmd_export.tmd", Dummy())
         sys.exit(0)
 
     register()
