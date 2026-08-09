@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 .blend to TMD export.
 Only objects in "Collection" collection are exported, they're automatically joined and triangulated.
